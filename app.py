@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-import sqlite3
+from flask_sqlalchemy import SQLAlchemy
 from twilio.rest import Client
 import random
 import stripe
@@ -9,6 +9,10 @@ import requests
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'  # Change in prod
+
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
@@ -22,27 +26,34 @@ GROK_API_KEY = os.getenv('GROK_API_KEY')
 stripe.api_key = STRIPE_SECRET
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-# DB setup
-conn = sqlite3.connect('disputes.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, phone TEXT UNIQUE, verified INTEGER)''')
-c.execute('''CREATE TABLE IF NOT EXISTS disputes (id INTEGER PRIMARY KEY, creator_id INTEGER, status TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS parties (id INTEGER PRIMARY KEY, dispute_id INTEGER, user_id INTEGER, submitted INTEGER, truth TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS resolutions (id INTEGER PRIMARY KEY, dispute_id INTEGER, verdict TEXT)''')
-conn.commit()
+class User(db.Model, UserMixin):
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), unique=True)
+    verified = db.Column(db.Integer, default=0)
 
-class User(UserMixin):
-    def __init__(self, id, phone):
-        self.id = id
-        self.phone = phone
+class Dispute(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    status = db.Column(db.String(50))
+
+class Party(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    dispute_id = db.Column(db.Integer, db.ForeignKey('dispute.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    submitted = db.Column(db.Integer, default=0)
+    truth = db.Column(db.Text)
+
+class Resolution(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    dispute_id = db.Column(db.Integer, db.ForeignKey('dispute.id'))
+    verdict = db.Column(db.Text)
+
+with app.app_context():
+    db.create_all()
 
 @login_manager.user_loader
 def load_user(user_id):
-    c.execute('SELECT * FROM users WHERE id=?', (user_id,))
-    row = c.fetchone()
-    if row:
-        return User(row[0], row[1])
-    return None
+    return db.session.get(User, user_id)
 
 @app.route('/')
 def index():
@@ -52,8 +63,11 @@ def index():
 def signup():
     if request.method == 'POST':
         phone = request.form['phone']
-        c.execute('INSERT OR IGNORE INTO users (phone, verified) VALUES (?, 0)', (phone,))
-        conn.commit()
+        user = User.query.filter_by(phone=phone).first()
+        if not user:
+            user = User(phone=phone, verified=0)
+            db.session.add(user)
+            db.session.commit()
         session['phone'] = phone
         send_verification(phone)
         return redirect(url_for('verify'))
@@ -70,11 +84,9 @@ def verify():
         code = int(request.form['code'])
         if code == session.get('code'):
             phone = session['phone']
-            c.execute('UPDATE users SET verified=1 WHERE phone=?', (phone,))
-            c.execute('SELECT id FROM users WHERE phone=?', (phone,))
-            user_id = c.fetchone()[0]
-            conn.commit()
-            user = User(user_id, phone)
+            user = User.query.filter_by(phone=phone).first()
+            user.verified = 1
+            db.session.commit()
             login_user(user)
             flash('Verified')
             return redirect('/')
@@ -85,8 +97,8 @@ def verify():
 def login():
     if request.method == 'POST':
         phone = request.form['phone']
-        c.execute('SELECT * FROM users WHERE phone=? AND verified=1', (phone,))
-        if c.fetchone():
+        user = User.query.filter_by(phone=phone, verified=1).first()
+        if user:
             session['phone'] = phone
             send_verification(phone)
             return redirect(url_for('verify'))
@@ -103,38 +115,31 @@ def logout():
 @login_required
 def create_dispute():
     if request.method == 'POST':
-        c.execute('INSERT INTO disputes (creator_id, status) VALUES (?, "open")', (current_user.id,))
-        dispute_id = c.lastrowid
-        conn.commit()
-        # Add creator as party 1
-        c.execute('INSERT INTO parties (dispute_id, user_id, submitted) VALUES (?, ?, 0)', (dispute_id, current_user.id,))
-        # Assume 2 via link; for now redirect
-        return redirect(url_for('dispute', dispute_id=dispute_id))
+        dispute = Dispute(creator_id=current_user.id, status='open')
+        db.session.add(dispute)
+        db.session.commit()
+        party = Party(dispute_id=dispute.id, user_id=current_user.id, submitted = 0
+        db.session.add(party)
+        db.session.commit()
+        return redirect(url_for('dispute', dispute_id=dispute.id))
     return render_template('create_dispute.html')
 
 @app.route('/dispute/<int:dispute_id>', methods=['GET', 'POST'])
 @login_required
 def dispute(dispute_id):
-    # Join if not party
-    c.execute('SELECT * FROM parties WHERE dispute_id=? AND user_id=?', (dispute_id, current_user.id))
-    if not c.fetchone():
-        c.execute('INSERT INTO parties (dispute_id, user_id, submitted) VALUES (?, ?, 0)', (dispute_id, current_user.id))
-        conn.commit()
-    # Show parties
-    c.execute('SELECT users.phone, parties.submitted FROM parties JOIN users ON users.id = parties.user_id WHERE dispute_id=?', (dispute_id,))
-    parties = c.fetchall()
-    # If submitted
-    if all submitted, generate if not
-    c.execute('SELECT COUNT(*) FROM parties WHERE dispute_id=?', (dispute_id,))
-    total = c.fetchone()[0]
-    c.execute('SELECT COUNT(*) FROM parties WHERE dispute_id=? AND submitted=1', (dispute_id,))
-    subs = c.fetchone()[0]
+    party = Party.query.filter_by(dispute_id=dispute_id, user_id=current_user.id).first()
+    if not party:
+        party = Party(dispute_id=dispute_id, user_id=current_user.id, submitted=0)
+        db.session.add(party)
+        db.session.commit()
+    parties = db.session.query(User.phone, Party.submitted).join(Party, User.id == Party.user_id).filter(Party.dispute_id==dispute_id).all()
+    total = Party.query.filter_by(dispute_id=dispute_id).count()
+    subs = Party.query.filter_by(dispute_id=dispute_id, submitted=1).count()
     if subs == total and total > 1:
         generate_verdict(dispute_id)
-    # Get verdict if exists
-    c.execute('SELECT verdict FROM resolutions WHERE dispute_id=?', (dispute_id,))
-    verdict = c.fetchone()
-    return render_template('dispute.html', dispute_id=dispute_id, parties=parties, verdict=verdict, link=f'{request.host_url}dispute/join/{dispute_id)}')
+    resolution = Resolution.query.filter_by(dispute_id=dispute_id).first()
+    verdict = resolution.verdict if resolution else None
+    return render_template('dispute.html', dispute_id=dispute_id, parties=parties, verdict=verdict, link=f'{request.host_url}dispute/join/{dispute_id}')
 
 @app.route('/dispute/join/<int:dispute_id>')
 def join_dispute(dispute_id):
@@ -146,31 +151,29 @@ def join_dispute(dispute_id):
 @login_required
 def submit_truth(dispute_id):
     truth = request.form['truth']
-    # Pay $1
     try:
         charge = stripe.Charge.create(
-            amount=100,  # cents
+            amount=100,
             currency='usd',
             description='Dispute submit',
-            source=request.form['stripeToken']  # From frontend form
+            source=request.form['stripeToken')  # Fix typo if 'stripeToken'
         )
-        c.execute('UPDATE parties SET submitted=1, truth=? WHERE dispute_id=? AND dispute_id=?', (truth, current_user.id, dispute_id))
-        conn.commit()
+        party = Party.query.filter_by(dispute_id=dispute_id, user_id=current_user.id).first()
+        party.submitted = 1
+        party.truth = truth
+        db.session.commit()
         flash('Submitted and paid')
     except:
         flash('Payment failed')
     return redirect(url_for('dispute', dispute_id=dispute_id))
 
 def generate_verdict(dispute_id):
-    c.execute('SELECT truth FROM parties WHERE dispute_id=?', (dispute_id,))
-    truths = [row[0] for row in c.fetchall()]
-    prompt = f"Resolve fairly: Party1: {truths[0]} Party2: {truths[1] if len(truths)>1 else ''}"  # Extend for more
+    truths = [p.truth for p in Party.query.filter_by(dispute_id=dispute_id).all()]
+    prompt = f"Resolve fairly: Party1: {truths[0]} Party2: {truths[1] if len(truths)>1 else ''}"
     headers = {'Authorization': f'Bearer {GROK_API_KEY}', 'Content-Type': 'application/json'}
     data = {'model': 'grok', 'messages': [{'role': 'user', 'content': prompt}]}
-    response = requests.post('https://api.x.ai/v1/chat/completions', headers=headers, json=data)  # Adjust endpoint per docs
+    response = requests.post('https://api.x.ai/v1/chat/completions', headers=headers, json=data)  # Adjust if needed
     verdict = response.json()['choices'][0]['message']['content']
-    c.execute('INSERT INTO resolutions (dispute_id, verdict) VALUES (?, ?)', (dispute_id, verdict))
-    conn.commit()
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    resolution = Resolution(dispute_id=dispute_id, verdict=verdict)
+    db.session.add(resolution)
+    db.session.commit()
